@@ -28,16 +28,6 @@ canvas{
   pointer-events:none;
 }
 
-.word{
-  font-size: clamp(44px, 7vw, 92px);
-  letter-spacing: -0.03em;
-  color: var(--text);
-  text-shadow:
-    0 8px 60px rgba(0,0,0,.55),
-    0 0 18px rgba(255,255,255,.18);
-  transform: translateZ(0);
-}
-
 .glow{
   position:absolute;
   width:min(620px, 80vw);
@@ -60,3 +50,70 @@ canvas{
 @media (prefers-reduced-motion: reduce){
   .glow{ animation:none }
 }
+
+/* ===== Laser engraving effect ===== */
+.engrave{
+  text-align:center;
+  padding: 10px 16px;
+  border: 1px solid rgba(255,255,255,.10);
+  border-radius: 18px;
+  background: rgba(255,255,255,.03);
+  box-shadow: 0 20px 80px rgba(0,0,0,.35);
+  backdrop-filter: blur(10px);
+}
+
+.line{
+  margin: 6px 0;
+  font-size: clamp(44px, 7vw, 92px);
+  letter-spacing: -0.03em;
+  transform: translateZ(0);
+}
+.line.small{
+  font-size: clamp(24px, 4vw, 52px);
+  letter-spacing: .02em;
+}
+
+/* Engraving happens on the span: "cut" + bevel highlights */
+.line span{
+  color: transparent;
+  -webkit-text-stroke: 1px rgba(255,255,255,.10);
+  text-shadow:
+    0 -1px 0 rgba(255,255,255,.18),
+    0  1px 0 rgba(0,0,0,.78),
+    0  2px 8px rgba(0,0,0,.55),
+    0  0 16px rgba(120,200,255,.10);
+  filter: contrast(1.15);
+}
+
+/* Subtle scanning "laser" line */
+.laser{
+  position: absolute;
+  left: 8%;
+  right: 8%;
+  top: 50%;
+  height: 2px;
+  background: linear-gradient(90deg,
+    transparent,
+    rgba(120,220,255,.25),
+    rgba(255,255,255,.10),
+    rgba(120,220,255,.25),
+    transparent
+  );
+  opacity: .55;
+  animation: scan 3.2s ease-in-out infinite;
+  pointer-events:none;
+  filter: blur(.2px);
+}
+
+@keyframes scan{
+  0%   { transform: translateY(-70px); opacity: .12; }
+  45%  { opacity: .55; }
+  50%  { transform: translateY(0px);   opacity: .75; }
+  55%  { opacity: .55; }
+  100% { transform: translateY(70px);  opacity: .12; }
+}
+
+@media (prefers-reduced-motion: reduce){
+  .laser{ animation:none; display:none; }
+}
+/* ===== End engraving effect ===== */

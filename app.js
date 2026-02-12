@@ -1,28 +1,50 @@
-// Fullscreen screensaver: drifting particles + laser-drawn text on canvas.
-// Text requested:
+// Smooth laser "handwriting": continuous beam motion + persistent white letters (no fade).
+// Fixes jerkiness by interpolating along segments and drawing a continuous tip trajectory.
+
 const TEXT = "Welcome to Electrical & Instrumentation Dashboard";
 
-// Tuning
 const CONFIG = {
-  particleCount: 160,
-  particleMaxSpeed: 0.65,
-  linkDistance: 120,
-
-  // Laser draw
   fontFamily: 'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif',
-  fontWeight: 650,
-  // target font size is computed from screen width; this is a multiplier
-  fontScale: 0.090,        // bigger -> larger text
+  fontWeight: 750,
+  fontScale: 0.082,
   lineHeight: 1.15,
+  maxLineWidthRatio: 0.86,
 
-  // Sampling density: smaller step = more points (heavier)
-  sampleStep: 4,           // pixels
-  revealRate: 900,         // points per second revealed
-  sweepSpeed: 1200,        // px/sec for scanning beam effect
+  // Sampling density (lower = more points, smoother but heavier)
+  sampleStep: 1,
+
+  // Continuous motion speed (points/sec along sampled points)
+  pointsPerSecond: 2000,
+
+  // Beam look
+  coreWidth: 1.4,
+  midWidth: 4.2,
+  outerWidth: 11.0,
+  coreAlpha: 0.95,
+  midAlpha: 0.24,
+  outerAlpha: 0.12,
+  outerBlur: 18,
+  midBlur: 8,
+  coreBlur: 2,
+  hotspotRadius: 3.6,
+  hotspotGlow: 22,
+
+  // Text permanence
+  textDotRadius: 1.05,
+  textHardAlpha: 1.0,
+  textSoftGlowAlpha: 0.12,
+  textGlowRadius: 7.5,
+
+  // Beam tail
+  tailLength: 60,      // number of past tip positions
+  tailStepMin: 1.4,    // min px distance between stored tip positions (reduces noise)
+
+  // Background
+  blobStrength: 0.28,
 
   // Colors
-  laserWhite: [255, 255, 255],
-  laserRed:   [255, 64,  64],
+  textWhite: [255,255,255],
+  beamRed:   [255,70,70],
 };
 
 const canvas = document.getElementById("c");
@@ -30,50 +52,28 @@ const ctx = canvas.getContext("2d", { alpha: false });
 
 let w=0,h=0,dpr=1;
 
-function resize(){
-  dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
-  w = canvas.clientWidth = window.innerWidth;
-  h = canvas.clientHeight = window.innerHeight;
-  canvas.width = Math.floor(w * dpr);
-  canvas.height = Math.floor(h * dpr);
-  ctx.setTransform(dpr,0,0,dpr,0,0);
-  buildTextPoints();
-}
-window.addEventListener("resize", resize, { passive:true });
-
-function rnd(a,b){ return a + Math.random()*(b-a); }
 function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
-function mix(a,b,t){ return a + (b-a)*t; }
+function rnd(a,b){ return a + Math.random()*(b-a); }
+function rgba(rgb,a){ return `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${a})`; }
+function lerp(a,b,t){ return a + (b-a)*t; }
 
-resize();
+// Persistent buffer holding written letters (never faded)
+const glow = document.createElement("canvas");
+const gctx = glow.getContext("2d");
 
-// ---------- Background particles ----------
-const particles = [];
-function initParticles(){
-  particles.length = 0;
-  for(let i=0;i<CONFIG.particleCount;i++){
-    particles.push({
-      x: rnd(0,w),
-      y: rnd(0,h),
-      vx: rnd(-CONFIG.particleMaxSpeed, CONFIG.particleMaxSpeed),
-      vy: rnd(-CONFIG.particleMaxSpeed, CONFIG.particleMaxSpeed),
-      r: rnd(1.0, 2.3),
-      hue: rnd(190, 320),
-    });
-  }
-}
-initParticles();
-
-// ---------- Text sampling ----------
-let textPoints = [];
-let revealCount = 0;
-let textBounds = null;
-
+// Offscreen sampling canvas
 const off = document.createElement("canvas");
-const offCtx = off.getContext("2d", { willReadFrequently: true });
+const offCtx = off.getContext("2d", { willReadFrequently:true });
+
+// State
+let letters = [];              // [{points:[]}]
+let curL = 0;                  // letter index
+let curIdx = 0;                // point index within current letter
+let curT = 0;                  // fractional progress to next point [0..1)
+let tip = null;                // current tip position {x,y}
+let tail = [];                 // recent tip positions for beam tail
 
 function splitLines(str, maxWidth, font){
-  // basic greedy wrap
   const words = str.split(/\s+/).filter(Boolean);
   const lines = [];
   let line = "";
@@ -91,273 +91,387 @@ function splitLines(str, maxWidth, font){
   return lines;
 }
 
-function buildTextPoints(){
-  // Prepare offscreen
-  off.width = Math.floor(w);
-  off.height = Math.floor(h);
-  offCtx.setTransform(1,0,0,1,0,0);
-  offCtx.clearRect(0,0,off.width,off.height);
-
-  // Font size based on viewport
-  const fs = clamp(Math.floor(w * CONFIG.fontScale), 34, 110);
+function buildLetters(){
+  letters = [];
+  const fs = clamp(Math.floor(w * CONFIG.fontScale), 30, 96);
   const font = `${CONFIG.fontWeight} ${fs}px ${CONFIG.fontFamily}`;
-
-  // Wrap text to fit ~80% width
-  const maxW = w * 0.82;
+  const maxW = w * CONFIG.maxLineWidthRatio;
   const lines = splitLines(TEXT, maxW, font);
-
-  // Compute total height
   const lh = fs * CONFIG.lineHeight;
   const totalH = lines.length * lh;
 
-  // Draw centered
-  const cx = w/2;
-  const cy = h/2;
-
-  offCtx.fillStyle = "white";
-  offCtx.textAlign = "center";
-  offCtx.textBaseline = "middle";
   offCtx.font = font;
+  offCtx.textBaseline = "middle";
+  offCtx.textAlign = "left";
 
-  const startY = cy - (totalH - lh)/2;
-  for(let i=0;i<lines.length;i++){
-    const y = startY + i*lh;
-    offCtx.fillText(lines[i], cx, y);
-  }
+  const startY = h/2 - (totalH - lh)/2;
 
-  const img = offCtx.getImageData(0,0,off.width,off.height).data;
-  const step = CONFIG.sampleStep;
+  for(let li=0; li<lines.length; li++){
+    const line = lines[li];
+    const y = startY + li*lh;
 
-  const pts = [];
-  let minX=1e9, minY=1e9, maxX=-1e9, maxY=-1e9;
+    const lineW = offCtx.measureText(line).width;
+    let x = (w - lineW)/2;
 
-  for(let y=0;y<off.height;y+=step){
-    for(let x=0;x<off.width;x+=step){
-      const a = img[(y*off.width + x)*4 + 3];
-      if(a > 12){
-        // jitter slightly to avoid grid look
-        const jx = x + rnd(-0.6, 0.6);
-        const jy = y + rnd(-0.6, 0.6);
-        pts.push({x:jx,y:jy});
-        if(jx<minX) minX=jx;
-        if(jy<minY) minY=jy;
-        if(jx>maxX) maxX=jx;
-        if(jy>maxY) maxY=jy;
+    for(const ch of line){
+      const chW = offCtx.measureText(ch).width;
+
+      if(ch === " "){
+        x += chW;
+        continue;
       }
+
+      const pad = Math.ceil(fs*0.35);
+      const boxW = Math.max(1, Math.ceil(chW + pad*2));
+      const boxH = Math.max(1, Math.ceil(lh + pad*2));
+
+      off.width = boxW;
+      off.height = boxH;
+      offCtx.setTransform(1,0,0,1,0,0);
+      offCtx.clearRect(0,0,off.width,off.height);
+
+      offCtx.fillStyle = "white";
+      offCtx.font = font;
+      offCtx.textAlign = "left";
+      offCtx.textBaseline = "middle";
+      offCtx.fillText(ch, pad, boxH/2);
+
+      const img = offCtx.getImageData(0,0,off.width,off.height).data;
+      const step = CONFIG.sampleStep;
+
+      const pts = [];
+      let minX=1e9,minY=1e9,maxX=-1e9,maxY=-1e9;
+
+      for(let yy=0; yy<off.height; yy+=step){
+        for(let xx=0; xx<off.width; xx+=step){
+          const a = img[(yy*off.width + xx)*4 + 3];
+          if(a > 12){
+            const px = x + (xx - pad) + rnd(-0.25,0.25);
+            const py = y + (yy - boxH/2) + rnd(-0.25,0.25);
+            pts.push({x:px,y:py});
+            if(px<minX) minX=px;
+            if(py<minY) minY=py;
+            if(px>maxX) maxX=px;
+            if(py>maxY) maxY=py;
+          }
+        }
+      }
+
+      // Sort to create a smooth-ish trace path for each letter.
+      // We do a simple "nearest-neighbor" chaining starting from top-left.
+      if(pts.length > 2){
+        // pick start: smallest y then x
+        let start = 0;
+        for(let i=1;i<pts.length;i++){
+          if(pts[i].y < pts[start].y || (pts[i].y === pts[start].y && pts[i].x < pts[start].x)) start = i;
+        }
+        const ordered = [];
+        const used = new Array(pts.length).fill(false);
+        let cur = start;
+        used[cur] = true;
+        ordered.push(pts[cur]);
+
+        for(let k=1;k<pts.length;k++){
+          let best = -1;
+          let bestD = 1e18;
+          const cx = pts[cur].x, cy = pts[cur].y;
+          // limited search window for speed: scan all (still ok for small letters)
+          for(let j=0;j<pts.length;j++){
+            if(used[j]) continue;
+            const dx = pts[j].x - cx;
+            const dy = pts[j].y - cy;
+            const d = dx*dx + dy*dy;
+            if(d < bestD){
+              bestD = d; best = j;
+            }
+          }
+          if(best === -1) break;
+          used[best] = true;
+          ordered.push(pts[best]);
+          cur = best;
+        }
+        letters.push({ points: ordered });
+      } else {
+        letters.push({ points: pts });
+      }
+
+      x += chW;
     }
   }
 
-  // Sort points in a "scanline" order so the laser looks like it's drawing
-  pts.sort((p,q)=>{
-    const by = Math.floor(p.y/step) - Math.floor(q.y/step);
-    if(by !== 0) return by;
-    // alternate direction each row for a continuous sweep
-    const row = Math.floor(p.y/step);
-    return (row % 2 === 0) ? (p.x - q.x) : (q.x - p.x);
-  });
-
-  textPoints = pts;
-  revealCount = 0;
-  textBounds = {minX, minY, maxX, maxY, fs};
+  // Reset written buffer + draw state
+  gctx.clearRect(0,0,w,h);
+  curL = 0; curIdx = 0; curT = 0;
+  tip = null;
+  tail = [];
 }
-buildTextPoints();
 
-// ---------- Laser + glow buffer ----------
-const glow = document.createElement("canvas");
-const gctx = glow.getContext("2d");
-function resizeGlow(){
-  glow.width = Math.floor(w * dpr);
-  glow.height = Math.floor(h * dpr);
+function resize(){
+  dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  w = window.innerWidth;
+  h = window.innerHeight;
+
+  canvas.width = Math.max(1, Math.floor(w*dpr));
+  canvas.height = Math.max(1, Math.floor(h*dpr));
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+
+  glow.width = Math.max(1, Math.floor(w*dpr));
+  glow.height = Math.max(1, Math.floor(h*dpr));
   gctx.setTransform(dpr,0,0,dpr,0,0);
   gctx.clearRect(0,0,w,h);
+
+  buildLetters();
 }
-resizeGlow();
+window.addEventListener("resize", resize, { passive:true });
+resize();
 
-window.addEventListener("resize", resizeGlow, { passive:true });
-
-// Keep a persistent "engraved" / burned-in look by slowly fading the glow buffer.
-function fadeGlow(){
-  gctx.fillStyle = "rgba(5,8,20,0.06)"; // low alpha = slow decay
-  gctx.fillRect(0,0,w,h);
-}
-
-// Convert rgb array + alpha to rgba string
-function rgba(rgb, a){ return `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${a})`; }
-
-// ---------- Animation state ----------
-let last = performance.now();
-let sweepX = 0;
-let sweepDir = 1;
-let completedAt = 0;
-
-function step(now){
-  const dt = Math.min(0.033, (now - last) / 1000);
-  last = now;
-
-  // Background
+// Background
+function drawBackground(t){
   ctx.fillStyle = "#050814";
   ctx.fillRect(0,0,w,h);
 
-  // vignette
-  const vg = ctx.createRadialGradient(w*0.5,h*0.45, 10, w*0.5,h*0.45, Math.max(w,h)*0.78);
-  vg.addColorStop(0, "rgba(255,255,255,0.03)");
-  vg.addColorStop(1, "rgba(0,0,0,0.68)");
-  ctx.fillStyle = vg;
-  ctx.fillRect(0,0,w,h);
+  const x1 = w*(0.25 + 0.08*Math.sin(t*0.0004));
+  const y1 = h*(0.25 + 0.10*Math.cos(t*0.00035));
+  const x2 = w*(0.78 + 0.06*Math.cos(t*0.00028));
+  const y2 = h*(0.28 + 0.09*Math.sin(t*0.00031));
+  const x3 = w*(0.55 + 0.08*Math.sin(t*0.00022));
+  const y3 = h*(0.82 + 0.06*Math.cos(t*0.00027));
 
-  // move particles
-  for(const p of particles){
-    p.x += p.vx; p.y += p.vy;
-    if(p.x < -20) p.x = w + 20;
-    if(p.x > w + 20) p.x = -20;
-    if(p.y < -20) p.y = h + 20;
-    if(p.y > h + 20) p.y = -20;
+  const g1 = ctx.createRadialGradient(x1,y1, 10, x1,y1, Math.max(w,h)*0.55);
+  g1.addColorStop(0, `rgba(80,140,255,${CONFIG.blobStrength})`);
+  g1.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = g1; ctx.fillRect(0,0,w,h);
+
+  const g2 = ctx.createRadialGradient(x2,y2, 10, x2,y2, Math.max(w,h)*0.52);
+  g2.addColorStop(0, `rgba(210,80,255,${CONFIG.blobStrength*0.92})`);
+  g2.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = g2; ctx.fillRect(0,0,w,h);
+
+  const g3 = ctx.createRadialGradient(x3,y3, 10, x3,y3, Math.max(w,h)*0.60);
+  g3.addColorStop(0, `rgba(70,255,210,${CONFIG.blobStrength*0.45})`);
+  g3.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = g3; ctx.fillRect(0,0,w,h);
+
+  const vg = ctx.createRadialGradient(w*0.5,h*0.45, 10, w*0.5,h*0.45, Math.max(w,h)*0.85);
+  vg.addColorStop(0, "rgba(255,255,255,0.03)");
+  vg.addColorStop(1, "rgba(0,0,0,0.72)");
+  ctx.fillStyle = vg; ctx.fillRect(0,0,w,h);
+}
+
+// Text writing
+function burnPoint(p){
+  gctx.save();
+  gctx.globalCompositeOperation = "source-over";
+
+  // hard dot
+  gctx.fillStyle = rgba(CONFIG.textWhite, CONFIG.textHardAlpha);
+  gctx.beginPath();
+  gctx.arc(p.x,p.y, CONFIG.textDotRadius, 0, Math.PI*2);
+  gctx.fill();
+
+  // soft glow
+  gctx.shadowColor = rgba(CONFIG.textWhite, 0.35);
+  gctx.shadowBlur = CONFIG.textGlowRadius;
+  gctx.fillStyle = rgba(CONFIG.textWhite, CONFIG.textSoftGlowAlpha);
+  gctx.beginPath();
+  gctx.arc(p.x,p.y, CONFIG.textDotRadius, 0, Math.PI*2);
+  gctx.fill();
+
+  gctx.restore();
+}
+
+function beamLine(a, b){
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  ctx.lineCap = "round";
+
+  // red outer
+  ctx.shadowColor = rgba(CONFIG.beamRed, 0.60);
+  ctx.shadowBlur = CONFIG.outerBlur;
+  ctx.strokeStyle = rgba(CONFIG.beamRed, CONFIG.outerAlpha);
+  ctx.lineWidth = CONFIG.outerWidth;
+  ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+
+  // white mid
+  ctx.shadowColor = rgba(CONFIG.textWhite, 0.55);
+  ctx.shadowBlur = CONFIG.midBlur;
+  ctx.strokeStyle = rgba(CONFIG.textWhite, CONFIG.midAlpha);
+  ctx.lineWidth = CONFIG.midWidth;
+  ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+
+  // bright core
+  ctx.shadowColor = rgba(CONFIG.textWhite, 0.90);
+  ctx.shadowBlur = CONFIG.coreBlur;
+  ctx.strokeStyle = rgba(CONFIG.textWhite, CONFIG.coreAlpha);
+  ctx.lineWidth = CONFIG.coreWidth;
+  ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+
+  // hotspot at tip
+  ctx.shadowColor = rgba(CONFIG.textWhite, 0.95);
+  ctx.shadowBlur = CONFIG.hotspotGlow;
+  ctx.fillStyle = rgba(CONFIG.textWhite, 0.90);
+  ctx.beginPath(); ctx.arc(b.x,b.y, CONFIG.hotspotRadius, 0, Math.PI*2); ctx.fill();
+
+  ctx.shadowColor = rgba(CONFIG.beamRed, 0.90);
+  ctx.shadowBlur = CONFIG.hotspotGlow * 0.8;
+  ctx.fillStyle = rgba(CONFIG.beamRed, 0.22);
+  ctx.beginPath(); ctx.arc(b.x,b.y, CONFIG.hotspotRadius*2.6, 0, Math.PI*2); ctx.fill();
+
+  ctx.restore();
+}
+
+function dist(a,b){
+  const dx=a.x-b.x, dy=a.y-b.y;
+  return Math.hypot(dx,dy);
+}
+
+function pushTail(p){
+  if(!tail.length){
+    tail.push({x:p.x,y:p.y});
+    return;
+  }
+  const last = tail[tail.length-1];
+  if(dist(last,p) >= CONFIG.tailStepMin){
+    tail.push({x:p.x,y:p.y});
+    if(tail.length > CONFIG.tailLength) tail.shift();
+  }
+}
+
+function advanceTip(dt){
+  // Find next drawable letter with points
+  while(curL < letters.length && (!letters[curL].points || letters[curL].points.length < 2)){
+    curL++; curIdx=0; curT=0; tip=null; tail=[];
+  }
+  if(curL >= letters.length) return;
+
+  const pts = letters[curL].points;
+
+  // initialize tip
+  if(!tip){
+    tip = {x: pts[0].x, y: pts[0].y};
+    burnPoint(tip);
+    pushTail(tip);
+    curIdx = 0;
+    curT = 0;
   }
 
-  // links
-  for(let i=0;i<particles.length;i++){
-    const a = particles[i];
-    for(let j=i+1;j<particles.length;j++){
-      const b = particles[j];
-      const dx=a.x-b.x, dy=a.y-b.y;
-      const dist = Math.hypot(dx,dy);
-      if(dist < CONFIG.linkDistance){
-        const t = 1 - dist/CONFIG.linkDistance;
-        ctx.strokeStyle = `rgba(190,210,255,${0.16*t})`;
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(a.x,a.y);
-        ctx.lineTo(b.x,b.y);
-        ctx.stroke();
+  // move along path continuously
+  let remaining = CONFIG.pointsPerSecond * dt; // in "point units"
+  // We'll interpret "point units" as advancing along indices (not pixels)
+  // and use interpolation for smoothness.
+  while(remaining > 0 && curL < letters.length){
+    const pts2 = letters[curL].points;
+    if(curIdx >= pts2.length-1){
+      // finish this letter
+      curL++; curIdx=0; curT=0; tip=null; tail=[];
+      // skip empties
+      while(curL < letters.length && (!letters[curL].points || letters[curL].points.length < 2)){
+        curL++;
       }
+      if(curL >= letters.length) return;
+      continue;
+    }
+
+    // consume fractional part
+    const step = Math.min(1 - curT, remaining);
+    curT += step;
+    remaining -= step;
+
+    const a = pts2[curIdx];
+    const b = pts2[curIdx+1];
+    const p = { x: lerp(a.x,b.x,curT), y: lerp(a.y,b.y,curT) };
+
+    // burn along the segment for persistence (a few samples)
+    burnPoint(p);
+    tip = p;
+    pushTail(p);
+
+    if(curT >= 1){
+      curIdx++;
+      curT = 0;
     }
   }
+}
 
-  // particles
-  for(const p of particles){
-    ctx.fillStyle = `hsla(${p.hue}, 90%, 70%, 0.72)`;
-    ctx.beginPath();
-    ctx.arc(p.x,p.y,p.r,0,Math.PI*2);
-    ctx.fill();
-    ctx.fillStyle = `hsla(${p.hue}, 100%, 70%, 0.06)`;
-    ctx.beginPath();
-    ctx.arc(p.x,p.y,p.r*6.2,0,Math.PI*2);
-    ctx.fill();
+// Render tail beam
+function renderTail(){
+  if(tail.length < 2) return;
+  // draw from oldest to newest with slight fade
+  for(let i=1;i<tail.length;i++){
+    const a = tail[i-1];
+    const b = tail[i];
+    // fade factor
+    const t = i / tail.length;
+    // temporarily modulate alpha by t (newer brighter)
+    ctx.save();
+    const oa = CONFIG.outerAlpha * (0.35 + 0.65*t);
+    const ma = CONFIG.midAlpha   * (0.35 + 0.65*t);
+    const ca = CONFIG.coreAlpha  * (0.40 + 0.60*t);
+
+    ctx.globalCompositeOperation = "lighter";
+    ctx.lineCap = "round";
+
+    ctx.shadowColor = rgba(CONFIG.beamRed, 0.60);
+    ctx.shadowBlur = CONFIG.outerBlur;
+    ctx.strokeStyle = rgba(CONFIG.beamRed, oa);
+    ctx.lineWidth = CONFIG.outerWidth;
+    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+
+    ctx.shadowColor = rgba(CONFIG.textWhite, 0.55);
+    ctx.shadowBlur = CONFIG.midBlur;
+    ctx.strokeStyle = rgba(CONFIG.textWhite, ma);
+    ctx.lineWidth = CONFIG.midWidth;
+    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+
+    ctx.shadowColor = rgba(CONFIG.textWhite, 0.90);
+    ctx.shadowBlur = CONFIG.coreBlur;
+    ctx.strokeStyle = rgba(CONFIG.textWhite, ca);
+    ctx.lineWidth = CONFIG.coreWidth;
+    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+
+    ctx.restore();
   }
 
-  // Fade glow buffer slightly, then add new revealed points
-  fadeGlow();
+  // tip hotspot
+  const b = tail[tail.length-1];
+  const a = tail[tail.length-2];
+  beamLine(a,b);
+}
 
-  // Reveal points over time
-  if(textPoints.length){
-    const add = Math.floor(CONFIG.revealRate * dt);
-    revealCount = Math.min(textPoints.length, revealCount + add);
-  }
+let last = performance.now();
+function frame(t){
+  const dt = Math.min(0.05, (t-last)/1000); // allow slightly larger dt without jumping
+  last = t;
 
-  // Draw revealed points into glow buffer (white core + red fringe)
-  for(let i=Math.max(0, revealCount - 2500); i<revealCount; i++){ // only draw recent batch for performance
-    const p = textPoints[i];
-    // core
-    gctx.fillStyle = rgba(CONFIG.laserWhite, 0.55);
-    gctx.beginPath();
-    gctx.arc(p.x,p.y, 0.85, 0, Math.PI*2);
-    gctx.fill();
+  drawBackground(t);
 
-    // red tint halo
-    gctx.fillStyle = rgba(CONFIG.laserRed, 0.12);
-    gctx.beginPath();
-    gctx.arc(p.x,p.y, 3.6, 0, Math.PI*2);
-    gctx.fill();
-  }
-
-  // Composite glow buffer onto main canvas
+  // draw written text (persistent)
   ctx.drawImage(glow, 0,0, w,h);
 
-  // Laser "shooting" sweep line (white + red)
-  if(textBounds){
-    const minX = textBounds.minX - 40;
-    const maxX = textBounds.maxX + 40;
-    const range = (maxX - minX) || 1;
+  // advance and render continuous beam
+  advanceTip(dt);
+  renderTail();
 
-    // Move sweep
-    sweepX += sweepDir * CONFIG.sweepSpeed * dt;
-    if(sweepX > range){
-      sweepX = range; sweepDir = -1;
-    } else if(sweepX < 0){
-      sweepX = 0; sweepDir = 1;
-    }
-
-    const x = minX + sweepX;
-
-    // Only show strong laser while revealing
-    const progress = revealCount / (textPoints.length || 1);
-    const active = progress < 1 ? 1 : 0.35;
-
-    // glow beam
-    ctx.strokeStyle = `rgba(255,255,255,${0.10*active})`;
-    ctx.lineWidth = 5;
-    ctx.beginPath();
-    ctx.moveTo(x, textBounds.minY-30);
-    ctx.lineTo(x, textBounds.maxY+30);
-    ctx.stroke();
-
-    // red inner beam
-    ctx.strokeStyle = `rgba(255,64,64,${0.18*active})`;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(x, textBounds.minY-30);
-    ctx.lineTo(x, textBounds.maxY+30);
-    ctx.stroke();
-
-    // hotspot at intersection with the "current" row based on progress
-    const idx = Math.min(textPoints.length-1, Math.floor(revealCount));
-    if(idx >= 0 && textPoints[idx]){
-      const hp = textPoints[idx];
-      ctx.fillStyle = "rgba(255,255,255,0.55)";
-      ctx.beginPath();
-      ctx.arc(hp.x, hp.y, 4.2, 0, Math.PI*2);
-      ctx.fill();
-
-      ctx.fillStyle = "rgba(255,64,64,0.22)";
-      ctx.beginPath();
-      ctx.arc(hp.x, hp.y, 12, 0, Math.PI*2);
-      ctx.fill();
-    }
-
-    // When fully revealed, keep a gentle shimmer and occasionally restart
-    if(progress >= 1){
-      if(!completedAt) completedAt = now;
-      const since = (now - completedAt)/1000;
-      // subtle shimmer
-      const shimmer = 0.06 + 0.04*Math.sin(now/900);
-      ctx.fillStyle = `rgba(120,200,255,${shimmer})`;
-      ctx.fillRect(textBounds.minX-8, textBounds.minY-8, (textBounds.maxX-textBounds.minX)+16, (textBounds.maxY-textBounds.minY)+16);
-
-      if(since > 14){
-        // restart the "laser drawing" cycle
-        revealCount = 0;
-        completedAt = 0;
-        gctx.clearRect(0,0,w,h);
-      }
-    } else {
-      completedAt = 0;
-    }
-  }
-
-  requestAnimationFrame(step);
+  requestAnimationFrame(frame);
 }
 
 const reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-if(!reduced) requestAnimationFrame(step);
+if(!reduced) requestAnimationFrame(frame);
 else {
-  // Draw a static frame for reduced motion users
-  ctx.fillStyle = "#050814";
-  ctx.fillRect(0,0,w,h);
-  // draw text plainly
-  ctx.fillStyle = "rgba(255,255,255,.85)";
+  drawBackground(performance.now());
+  // Render static text directly onto main canvas
+  ctx.fillStyle = "rgba(255,255,255,0.96)";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  const fs = clamp(Math.floor(w * CONFIG.fontScale), 34, 110);
-  ctx.font = `${CONFIG.fontWeight} ${fs}px ${CONFIG.fontFamily}`;
-  ctx.fillText(TEXT, w/2, h/2);
+  const fs = clamp(Math.floor(w * CONFIG.fontScale), 30, 96);
+  const font = `${CONFIG.fontWeight} ${fs}px ${CONFIG.fontFamily}`;
+  offCtx.font = font;
+  ctx.font = font;
+  const lines = splitLines(TEXT, w * CONFIG.maxLineWidthRatio, font);
+  const lh = fs * CONFIG.lineHeight;
+  const totalH = lines.length * lh;
+  const startY = h/2 - (totalH - lh)/2;
+  for(let i=0;i<lines.length;i++){
+    ctx.fillText(lines[i], w/2, startY + i*lh);
+  }
 }
